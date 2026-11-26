@@ -1,6 +1,6 @@
 ; Inno Setup 6 Script for AIgiveaway (Windows Only)
 #define MyAppName "AIgiveaway"
-#define MyAppVersion "1.0.0"
+#define MyAppVersion "1.0.1"
 #define MyAppPublisher "solarUpdateCode"
 #define MyAppURL "https://github.com/solarUpdateCode/AIgiveaway"
 #define MyAppExeName "AIgiveaway.exe"
