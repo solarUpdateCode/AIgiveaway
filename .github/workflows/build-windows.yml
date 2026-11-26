@@ -1,0 +1,72 @@
+name: Build Windows App & Installer
+
+on:
+  push:
+    branches: [ main, master ]
+    tags: [ 'v*' ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: "pip"
+
+      - name: Install dependencies & PyInstaller
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller pytest
+
+      - name: Run unit tests
+        run: python -m pytest -v
+
+      - name: Generate Windows application icon
+        run: python -m app.icon_gen
+
+      - name: Compile Windows executable (PyInstaller)
+        run: pyinstaller --clean --noconfirm build/AIgiveaway.spec
+
+      - name: Build Windows Installer (Inno Setup)
+        run: |
+          $iscc = "C:\Program Files (x86)\Inno Setup 6\ISCC.exe"
+          if (-not (Test-Path $iscc)) {
+            choco install innosetup -y --no-progress
+          }
+          & $iscc installer\AIgiveaway.iss
+
+      - name: Package Portable Windows ZIP
+        run: |
+          Compress-Archive -Path dist\AIgiveaway\* -DestinationPath installer\output\AIgiveaway-Portable-Windows.zip -Force
+
+      - name: Upload Windows Installer & Portable Artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: AIgiveaway-Windows-Installer
+          path: |
+            installer/output/AIgiveaway-Setup-*.exe
+            installer/output/AIgiveaway-Portable-Windows.zip
+
+      - name: Create GitHub Release (Windows Installer)
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.0.0' }}
+          name: "AIgiveaway Windows Release"
+          body: |
+            ## AIgiveaway — Windows Installer & Portable Build
+            - **Installer:** `AIgiveaway-Setup-1.0.0.exe` (recommended)
+            - **Portable ZIP:** `AIgiveaway-Portable-Windows.zip`
+          files: |
+            installer/output/AIgiveaway-Setup-*.exe
+            installer/output/AIgiveaway-Portable-Windows.zip
+          draft: false
+          prerelease: false
