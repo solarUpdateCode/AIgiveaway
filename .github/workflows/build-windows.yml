@@ -59,11 +59,11 @@ jobs:
       - name: Create GitHub Release (Windows Installer)
         uses: softprops/action-gh-release@v2
         with:
-          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.0.0' }}
+          tag_name: ${{ startsWith(github.ref, 'refs/tags/') && github.ref_name || 'v1.0.1' }}
           name: "AIgiveaway Windows Release"
           body: |
             ## AIgiveaway — Windows Installer & Portable Build
-            - **Installer:** `AIgiveaway-Setup-1.0.0.exe` (recommended)
+            - **Installer:** `AIgiveaway-Setup-1.0.1.exe` (recommended)
             - **Portable ZIP:** `AIgiveaway-Portable-Windows.zip`
           files: |
             installer/output/AIgiveaway-Setup-*.exe
