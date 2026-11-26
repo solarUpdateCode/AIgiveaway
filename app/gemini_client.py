@@ -1,17 +1,11 @@
-"""Gemini Vision REST client with full support for AQ.* Auth Keys and AIza keys.
-
-Handles both Google AI Studio (generativelanguage.googleapis.com) and Vertex AI
-Express Mode (aiplatform.googleapis.com) endpoints with automatic fallback,
-proper thinking-token configuration for Gemini 2.5/3.x, and automatic model
-fallback if a chosen model returns 404 NOT_FOUND.
-"""
+"""Multi-provider Vision AI client supporting Gemini, Ollama Cloud/Local, and Vercel AI Gateway."""
 
 from __future__ import annotations
 
 import base64
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple
 
 import requests
@@ -19,15 +13,75 @@ import requests
 
 GEMINI_STUDIO_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 VERTEX_EXPRESS_BASE = "https://aiplatform.googleapis.com/v1/publishers/google/models"
+OLLAMA_CLOUD_CHAT_URL = "https://ollama.com/api/chat"
+VERCEL_GATEWAY_CHAT_URL = "https://ai-gateway.vercel.sh/v1/chat/completions"
 
-AVAILABLE_MODELS = [
-    "gemini-2.5-flash",
-    "gemini-2.5-flash-lite",
-    "gemini-3.6-flash",
-    "gemini-3.5-flash-lite",
-    "gemini-2.0-flash",
-    "gemini-2.5-pro",
-]
+PROVIDER_LABELS = {
+    "gemini": "Google Gemini (AQ / AIza)",
+    "ollama_cloud": "Ollama Cloud API",
+    "vercel_gateway": "Vercel AI Gateway (vck_)",
+    "ollama_local": "Ollama Local (localhost:11434)",
+}
+
+LABEL_TO_PROVIDER = {v: k for k, v in PROVIDER_LABELS.items()}
+
+PROVIDER_MODELS: Dict[str, List[str]] = {
+    "gemini": [
+        "gemini-2.5-flash",
+        "gemini-2.5-flash-lite",
+        "gemini-3.6-flash",
+        "gemini-3.5-flash-lite",
+        "gemini-2.0-flash",
+        "gemini-2.5-pro",
+    ],
+    "ollama_cloud": [
+        "gemma4:31b",
+        "qwen2.5vl:72b",
+        "glm-5.3-flash:cloud",
+        "llama4:scout",
+        "llava",
+    ],
+    "vercel_gateway": [
+        "google/gemini-2.5-flash",
+        "google/gemini-2.5-flash-lite",
+        "openai/gpt-4o-mini",
+        "anthropic/claude-sonnet-4",
+        "zai/glm-5.2-fast",
+    ],
+    "ollama_local": [
+        "gemma4:e4b",
+        "qwen2.5vl:7b",
+        "llava:latest",
+        "llama3.2-vision",
+    ],
+}
+
+# Unified one-click dropdown presets: Display Label -> (provider_id, model_id)
+UNIFIED_MODEL_PRESETS: Dict[str, Tuple[str, str]] = {
+    "Gemini  •  gemini-2.5-flash": ("gemini", "gemini-2.5-flash"),
+    "Gemini  •  gemini-2.5-flash-lite": ("gemini", "gemini-2.5-flash-lite"),
+    "Gemini  •  gemini-3.6-flash": ("gemini", "gemini-3.6-flash"),
+    "Gemini  •  gemini-2.0-flash": ("gemini", "gemini-2.0-flash"),
+    "Ollama Cloud  •  gemma4:31b": ("ollama_cloud", "gemma4:31b"),
+    "Ollama Cloud  •  qwen2.5vl:72b": ("ollama_cloud", "qwen2.5vl:72b"),
+    "Ollama Cloud  •  glm-5.3-flash:cloud": ("ollama_cloud", "glm-5.3-flash:cloud"),
+    "Ollama Cloud  •  llama4:scout": ("ollama_cloud", "llama4:scout"),
+    "Vercel Gateway  •  google/gemini-2.5-flash": ("vercel_gateway", "google/gemini-2.5-flash"),
+    "Vercel Gateway  •  openai/gpt-4o-mini": ("vercel_gateway", "openai/gpt-4o-mini"),
+    "Vercel Gateway  •  anthropic/claude-sonnet-4": ("vercel_gateway", "anthropic/claude-sonnet-4"),
+    "Vercel Gateway  •  zai/glm-5.2-fast": ("vercel_gateway", "zai/glm-5.2-fast"),
+    "Ollama Local  •  gemma4:e4b": ("ollama_local", "gemma4:e4b"),
+    "Ollama Local  •  qwen2.5vl:7b": ("ollama_local", "qwen2.5vl:7b"),
+}
+
+AVAILABLE_MODELS = PROVIDER_MODELS["gemini"]
+
+
+def preset_label_for(provider: str, model: str) -> str:
+    for label, (prov, mod) in UNIFIED_MODEL_PRESETS.items():
+        if prov == provider and mod == model:
+            return label
+    return next(iter(UNIFIED_MODEL_PRESETS.keys()))
 
 
 @dataclass
@@ -48,12 +102,14 @@ class AgentDecision:
     item_name: Optional[str] = None
     giveaway_question: Optional[str] = None
     giveaway_answer: Optional[str] = None
+    detected_urls: List[str] = field(default_factory=list)
+    livestream_status: Optional[str] = None
     reason: str = ""
 
 
-SYSTEM_PROMPT = """You are AIgiveaway, a fast, careful visual automation agent watching ONLY ONE browser window showing https://cymatics.fm/ (usually a Cymatics livestream free-download / giveaway page).
+SYSTEM_PROMPT = """You are AIgiveaway, a fast, careful visual automation agent watching ONLY ONE browser window showing https://cymatics.fm/ (a Cymatics livestream free-download / giveaway page or livestream video/chat).
 
-Your mission has TWO priorities:
+Your mission has THREE jobs:
 
 PRIORITY 1 (URGENT - ALWAYS CHECK FIRST): RANDOM GIVEAWAY QUESTION
 - If a giveaway question popup, banner, chat prompt, or form appears on the page asking a trivia/giveaway question and/or asking for an email address:
@@ -81,8 +137,10 @@ PRIORITY 2 (NORMAL): FREE STUFF TRACKER & $0.00 CHECKOUT LOOP
    - If total is $0.00 / FREE: fill email if requested, or click "Complete Order" / "Complete Free Order" / "Continue".
 4. After Order Complete / Thank You page:
    - Set page_state="order_complete" and action="go_back" so we return to the livestream page to watch for newly unlocked freebies.
-5. If nothing new is currently unlocked and no giveaway question is visible:
-   - Either scroll_down gently to check lower items, or action="wait" if already at the bottom / waiting for the next livestream unlock.
+
+PRIORITY 3 (ALWAYS): LIVE STREAM & LINK EXTRACTION
+- If you see any visible URLs, drop links, or giveaway links on screen or in livestream chat, list them in "detected_urls".
+- Briefly note any livestream status in "livestream_status".
 
 Return STRICT JSON ONLY (no markdown fences, no commentary) matching this schema:
 {
@@ -102,6 +160,8 @@ Return STRICT JSON ONLY (no markdown fences, no commentary) matching this schema
   "item_name": null,
   "giveaway_question": null,
   "giveaway_answer": null,
+  "detected_urls": [],
+  "livestream_status": null,
   "reason": "short explanation of what you see and why you chose this action"
 }
 """
@@ -129,6 +189,9 @@ def parse_decision_json(raw_text: str) -> AgentDecision:
         fval = float(val)
         return max(0.0, min(1.0, fval))
 
+    raw_urls = data.get("detected_urls") or []
+    urls = [str(u).strip() for u in raw_urls if isinstance(u, str) and u.strip().startswith(("http://", "https://"))]
+
     return AgentDecision(
         page_state=str(data.get("page_state", "other")),
         priority=str(data.get("priority", "normal")),
@@ -146,39 +209,40 @@ def parse_decision_json(raw_text: str) -> AgentDecision:
         item_name=data.get("item_name"),
         giveaway_question=data.get("giveaway_question"),
         giveaway_answer=data.get("giveaway_answer"),
+        detected_urls=urls,
+        livestream_status=data.get("livestream_status"),
         reason=str(data.get("reason", "")),
     )
 
 
-def _generation_config_for_model(model: str, json_mode: bool = True) -> Dict[str, Any]:
-    cfg: Dict[str, Any] = {
-        "temperature": 0.1,
-        "maxOutputTokens": 2048,
-    }
+def _gemini_generation_config(model: str, json_mode: bool = True) -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {"temperature": 0.1, "maxOutputTokens": 2048}
     if json_mode:
         cfg["responseMimeType"] = "application/json"
-
-    ml = model.lower()
-    if ml.startswith("gemini-2.5-flash"):
+    if model.lower().startswith("gemini-2.5-flash"):
         cfg["thinkingConfig"] = {"thinkingBudget": 0}
     return cfg
 
 
-class GeminiVisionClient:
+class MultiProviderVisionClient:
     def __init__(
         self,
         api_key: str,
         model: str = "gemini-2.5-flash",
+        provider: str = "gemini",
         endpoint_mode: str = "auto",
-        timeout_sec: float = 25.0,
+        ollama_local_url: str = "http://localhost:11434",
+        timeout_sec: float = 30.0,
     ) -> None:
         self.api_key = (api_key or "").strip()
-        self.model = (model or "gemini-2.5-flash").strip()
+        self.provider = (provider or "gemini").strip()
+        self.model = (model or PROVIDER_MODELS.get(self.provider, ["gemini-2.5-flash"])[0]).strip()
         self.endpoint_mode = endpoint_mode
+        self.ollama_local_url = (ollama_local_url or "http://localhost:11434").rstrip("/")
         self.timeout_sec = timeout_sec
         self._resolved_endpoint: Optional[str] = None
 
-    def _build_request(self, mode: str, model: str) -> Tuple[str, Dict[str, str], Dict[str, str]]:
+    def _gemini_request(self, mode: str, model: str) -> Tuple[str, Dict[str, str], Dict[str, str]]:
         headers = {"Content-Type": "application/json"}
         params: Dict[str, str] = {}
         if mode == "vertex_express":
@@ -192,37 +256,27 @@ class GeminiVisionClient:
             headers["x-goog-api-key"] = self.api_key
         return url, headers, params
 
-    def _call_generate_content(self, payload_builder) -> Dict[str, Any]:
+    def _call_gemini(self, payload_builder) -> str:
         if not self.api_key:
-            raise ValueError("Gemini API key is empty. Paste your key in Settings.")
-
-        if self.endpoint_mode in ("gemini_studio", "vertex_express"):
-            modes_to_try = [self.endpoint_mode]
-        elif self._resolved_endpoint:
-            modes_to_try = [self._resolved_endpoint]
-        else:
-            modes_to_try = ["gemini_studio", "vertex_express", "gemini_studio_query"]
-
-        models_to_try = [self.model] + [m for m in AVAILABLE_MODELS if m != self.model and "flash" in m]
-
+            raise ValueError("Gemini API key is empty. Run setup_local_keys.bat or paste it once in API Keys.")
+        modes = (
+            [self.endpoint_mode]
+            if self.endpoint_mode in ("gemini_studio", "vertex_express")
+            else ([self._resolved_endpoint] if self._resolved_endpoint else ["gemini_studio", "vertex_express", "gemini_studio_query"])
+        )
+        models = [self.model] + [m for m in PROVIDER_MODELS["gemini"] if m != self.model and "flash" in m]
         last_error: Optional[str] = None
-        for model_name in models_to_try:
+        for model_name in models:
             payload = payload_builder(model_name)
             got_404_on_all = True
-            for mode in modes_to_try:
-                url, headers, params = self._build_request(mode, model_name)
+            for mode in modes:
+                url, headers, params = self._gemini_request(mode, model_name)
                 try:
-                    resp = requests.post(
-                        url,
-                        headers=headers,
-                        params=params,
-                        json=payload,
-                        timeout=self.timeout_sec,
-                    )
+                    resp = requests.post(url, headers=headers, params=params, json=payload, timeout=self.timeout_sec)
                     if resp.status_code == 200:
                         self._resolved_endpoint = mode
                         self.model = model_name
-                        return resp.json()
+                        return self._extract_gemini_text(resp.json())
                     if resp.status_code != 404:
                         got_404_on_all = False
                     last_error = f"HTTP {resp.status_code} ({mode}/{model_name}): {resp.text[:260]}"
@@ -237,43 +291,107 @@ class GeminiVisionClient:
                         if resp2.status_code == 200:
                             self._resolved_endpoint = mode
                             self.model = model_name
-                            return resp2.json()
+                            return self._extract_gemini_text(resp2.json())
                         last_error = f"HTTP {resp2.status_code} ({mode}/{model_name}): {resp2.text[:260]}"
                 except requests.RequestException as exc:
                     got_404_on_all = False
                     last_error = f"Network error ({mode}): {exc}"
-                    continue
-
             if not got_404_on_all:
                 break
-
         raise RuntimeError(last_error or "Gemini API request failed.")
 
     @staticmethod
-    def _extract_text(response_json: Dict[str, Any]) -> str:
+    def _extract_gemini_text(response_json: Dict[str, Any]) -> str:
         candidates = response_json.get("candidates") or []
         if not candidates:
             raise RuntimeError(f"Empty Gemini response: {response_json}")
         parts = candidates[0].get("content", {}).get("parts", [])
-        texts = [
-            p.get("text", "")
-            for p in parts
-            if isinstance(p, dict) and p.get("text") and not p.get("thought")
-        ]
+        texts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text") and not p.get("thought")]
         return "\n".join(texts).strip()
 
-    def test_connection(self) -> Tuple[bool, str]:
-        def _build(model_name: str) -> Dict[str, Any]:
-            return {
-                "contents": [{"role": "user", "parts": [{"text": "Reply with exactly: OK"}]}],
-                "generationConfig": _generation_config_for_model(model_name, json_mode=False),
-            }
+    def _call_ollama(self, prompt_text: str, system_text: Optional[str], b64_img: Optional[str], json_mode: bool) -> str:
+        is_cloud = self.provider == "ollama_cloud"
+        if is_cloud and not self.api_key:
+            raise ValueError("Ollama Cloud API key is empty. Run setup_local_keys.bat or paste it once.")
+        url = OLLAMA_CLOUD_CHAT_URL if is_cloud else f"{self.ollama_local_url}/api/chat"
+        headers = {"Content-Type": "application/json"}
+        if is_cloud:
+            headers["Authorization"] = f"Bearer {self.api_key}"
 
+        messages: List[Dict[str, Any]] = []
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+        user_msg: Dict[str, Any] = {"role": "user", "content": prompt_text}
+        if b64_img:
+            user_msg["images"] = [b64_img]
+        messages.append(user_msg)
+
+        payload: Dict[str, Any] = {"model": self.model, "messages": messages, "stream": False}
+        if json_mode:
+            payload["format"] = "json"
+
+        resp = requests.post(url, headers=headers, json=payload, timeout=self.timeout_sec)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Ollama HTTP {resp.status_code} ({self.model}): {resp.text[:300]}")
+        data = resp.json()
+        self._resolved_endpoint = "ollama_cloud" if is_cloud else "ollama_local"
+        msg = data.get("message") or {}
+        return str(msg.get("content", "")).strip()
+
+    def _call_vercel_gateway(self, prompt_text: str, system_text: Optional[str], b64_img: Optional[str], json_mode: bool) -> str:
+        if not self.api_key:
+            raise ValueError("Vercel AI Gateway key is empty. Run setup_local_keys.bat or paste it once.")
+        headers = {"Content-Type": "application/json", "Authorization": f"Bearer {self.api_key}"}
+        messages: List[Dict[str, Any]] = []
+        if system_text:
+            messages.append({"role": "system", "content": system_text})
+        if b64_img:
+            user_content: Any = [
+                {"type": "text", "text": prompt_text},
+                {"type": "image_url", "image_url": {"url": f"data:image/jpeg;base64,{b64_img}"}},
+            ]
+        else:
+            user_content = prompt_text
+        messages.append({"role": "user", "content": user_content})
+
+        payload: Dict[str, Any] = {"model": self.model, "messages": messages, "temperature": 0.1, "max_tokens": 1500}
+        if json_mode:
+            payload["response_format"] = {"type": "json_object"}
+
+        resp = requests.post(VERCEL_GATEWAY_CHAT_URL, headers=headers, json=payload, timeout=self.timeout_sec)
+        if resp.status_code == 400 and json_mode:
+            payload.pop("response_format", None)
+            resp = requests.post(VERCEL_GATEWAY_CHAT_URL, headers=headers, json=payload, timeout=self.timeout_sec)
+        if resp.status_code != 200:
+            raise RuntimeError(f"Vercel Gateway HTTP {resp.status_code} ({self.model}): {resp.text[:300]}")
+
+        data = resp.json()
+        self._resolved_endpoint = "vercel_gateway"
+        choices = data.get("choices") or []
+        if not choices:
+            raise RuntimeError(f"Empty Vercel Gateway response: {data}")
+        content = choices[0].get("message", {}).get("content", "")
+        if isinstance(content, list):
+            return "\n".join(str(p.get("text", "")) for p in content if isinstance(p, dict)).strip()
+        return str(content).strip()
+
+    def test_connection(self) -> Tuple[bool, str]:
         try:
-            res = self._call_generate_content(_build)
-            reply = self._extract_text(res)
-            endpoint_label = self._resolved_endpoint or self.endpoint_mode
-            return True, f"Connected ({endpoint_label}, {self.model}): {reply}"
+            if self.provider in ("ollama_cloud", "ollama_local"):
+                reply = self._call_ollama("Reply with exactly: OK", None, None, json_mode=False)
+                return True, f"Connected ({self.provider}, {self.model}): {reply[:80]}"
+            if self.provider == "vercel_gateway":
+                reply = self._call_vercel_gateway("Reply with exactly: OK", None, None, json_mode=False)
+                return True, f"Connected (vercel_gateway, {self.model}): {reply[:80]}"
+
+            def _build(model_name: str) -> Dict[str, Any]:
+                return {
+                    "contents": [{"role": "user", "parts": [{"text": "Reply with exactly: OK"}]}],
+                    "generationConfig": _gemini_generation_config(model_name, json_mode=False),
+                }
+
+            reply = self._call_gemini(_build)
+            return True, f"Connected ({self._resolved_endpoint or 'gemini'}, {self.model}): {reply[:80]}"
         except Exception as exc:
             return False, str(exc)
 
@@ -305,6 +423,13 @@ class GeminiVisionClient:
             "Inspect this screenshot of the ONLY allowed browser window and return your JSON decision."
         )
 
+        if self.provider in ("ollama_cloud", "ollama_local"):
+            raw = self._call_ollama(user_context, SYSTEM_PROMPT, b64_img, json_mode=True)
+            return parse_decision_json(raw)
+        if self.provider == "vercel_gateway":
+            raw = self._call_vercel_gateway(user_context, SYSTEM_PROMPT, b64_img, json_mode=True)
+            return parse_decision_json(raw)
+
         def _build(model_name: str) -> Dict[str, Any]:
             return {
                 "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
@@ -317,9 +442,11 @@ class GeminiVisionClient:
                         ],
                     }
                 ],
-                "generationConfig": _generation_config_for_model(model_name, json_mode=True),
+                "generationConfig": _gemini_generation_config(model_name, json_mode=True),
             }
 
-        res = self._call_generate_content(_build)
-        raw_text = self._extract_text(res)
-        return parse_decision_json(raw_text)
+        raw = self._call_gemini(_build)
+        return parse_decision_json(raw)
+
+
+GeminiVisionClient = MultiProviderVisionClient

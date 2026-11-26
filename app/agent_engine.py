@@ -1,4 +1,4 @@
-"""Background AI tracking engine for Cymatics.fm giveaways & free drops."""
+"""Background AI tracking engine for Cymatics.fm giveaways, free drops, and live stream links."""
 
 from __future__ import annotations
 
@@ -10,7 +10,7 @@ from typing import Callable, List, Optional
 from PIL import Image
 
 from app.config import AppConfig
-from app.gemini_client import AgentDecision, GeminiVisionClient
+from app.gemini_client import AgentDecision, MultiProviderVisionClient
 from app.window_controller import ScopedWindowController
 
 
@@ -21,6 +21,7 @@ class AgentStats:
     checkouts_completed: int = 0
     giveaways_answered: int = 0
     last_state: str = "idle"
+    livestream_status: str = ""
 
 
 class GiveawayAgentEngine:
@@ -33,17 +34,19 @@ class GiveawayAgentEngine:
         on_status: Callable[[str], None],
         on_preview: Callable[[Image.Image], None],
         on_stats: Callable[[AgentStats], None],
+        on_detected_urls: Optional[Callable[[List[str]], None]] = None,
     ) -> None:
         self.config = config
         self.on_log = on_log
         self.on_status = on_status
         self.on_preview = on_preview
         self.on_stats = on_stats
+        self.on_detected_urls = on_detected_urls
 
         self._stop_event = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._controller: Optional[ScopedWindowController] = None
-        self._client: Optional[GeminiVisionClient] = None
+        self._client: Optional[MultiProviderVisionClient] = None
         self._recent_actions: List[str] = []
         self.stats = AgentStats()
 
@@ -56,18 +59,20 @@ class GiveawayAgentEngine:
             return
         self.config = config
         self._controller = ScopedWindowController(hwnd=hwnd, mode=config.background_input_mode)
-        self._client = GeminiVisionClient(
-            api_key=config.api_key,
+        self._client = MultiProviderVisionClient(
+            api_key=config.get_active_api_key(),
             model=config.model,
+            provider=config.ai_provider,
             endpoint_mode=config.api_endpoint_mode,
+            ollama_local_url=config.ollama_local_url,
         )
         self._stop_event.clear()
         self._thread = threading.Thread(target=self._run_loop, name="AIgiveawayLoop", daemon=True)
         self._thread.start()
         self.on_status("RUNNING")
         self.on_log(
-            f"AI ON — Tracking window '{self._controller.get_title()}' "
-            f"(mode: {config.background_input_mode}, model: {config.model})."
+            f"AI ON — Window '{self._controller.get_title()}' | "
+            f"Provider: {config.ai_provider} | Model: {config.model}"
         )
 
     def stop(self) -> None:
@@ -83,7 +88,11 @@ class GiveawayAgentEngine:
     def _execute_decision(self, decision: AgentDecision) -> None:
         assert self._controller is not None
 
-        # Safety guardrail: NEVER complete paid checkouts
+        if decision.detected_urls and self.on_detected_urls:
+            self.on_detected_urls(decision.detected_urls)
+        if decision.livestream_status:
+            self.stats.livestream_status = decision.livestream_status
+
         if decision.page_state == "checkout" and decision.cart_total_is_zero is False:
             self.on_log(
                 f"[SAFETY STOP] Non-$0.00 checkout detected ({decision.reason}). "
@@ -92,7 +101,6 @@ class GiveawayAgentEngine:
             self._record_action("blocked_paid_checkout")
             return
 
-        # Priority 1: Fast Giveaway Question Solver
         if decision.action == "fill_giveaway":
             if not self.config.auto_answer_giveaway:
                 self.on_log("Giveaway question detected, but Auto-Answer Giveaway is disabled.")
@@ -118,20 +126,15 @@ class GiveawayAgentEngine:
                 self._controller.click_normalized(decision.submit_x_norm, decision.submit_y_norm)
                 self.stats.giveaways_answered += 1
                 self._record_action(f"submitted_giveaway:{decision.giveaway_answer}")
-                self.on_log(
-                    f"[GIVEAWAY SUBMITTED] Sent answer with {self.config.giveaway_email}."
-                )
+                self.on_log(f"[GIVEAWAY SUBMITTED] Sent answer with {self.config.giveaway_email}.")
             return
 
-        # Priority 2: Normal Free-Item / Learn-More / Checkout Actions
         if decision.action == "click" and decision.x_norm is not None and decision.y_norm is not None:
             if decision.page_state == "checkout" and not self.config.auto_checkout_free_only:
                 self.on_log("On checkout page, but Auto-Checkout ($0.00 Only) is disabled.")
                 return
             if decision.page_state == "checkout" and decision.cart_total_is_zero is not True:
-                self.on_log(
-                    "[SAFETY] Checkout total not confirmed as $0.00 — waiting instead of clicking."
-                )
+                self.on_log("[SAFETY] Checkout total not confirmed as $0.00 — waiting instead of clicking.")
                 return
 
             ok = self._controller.click_normalized(decision.x_norm, decision.y_norm)
@@ -171,9 +174,7 @@ class GiveawayAgentEngine:
 
         if decision.action == "go_back":
             if decision.page_state == "order_complete" and self.config.auto_return_to_page:
-                self.on_log(
-                    f"[RETURN] Order complete — returning to {self.config.target_url} to track new unlocks."
-                )
+                self.on_log(f"[RETURN] Order complete — returning to {self.config.target_url} to track new unlocks.")
                 self._controller.navigate_to_url(self.config.target_url)
             else:
                 self.on_log(f"[BACK] Returning to previous page ({decision.reason}).")
@@ -181,7 +182,6 @@ class GiveawayAgentEngine:
             self._record_action("go_back")
             return
 
-        # Default: wait
         if decision.reason:
             self.on_log(f"[WATCHING] {decision.reason}")
 
@@ -234,6 +234,5 @@ class GiveawayAgentEngine:
                 self.on_status("ERROR")
                 self.on_log(f"[API ERROR] {exc}")
 
-            # Wait configured interval (faster re-check right after giveaway or click)
             delay = max(0.8, float(self.config.scan_interval_sec))
             self._stop_event.wait(delay)

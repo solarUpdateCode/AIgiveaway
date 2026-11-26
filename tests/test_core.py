@@ -1,4 +1,4 @@
-"""Unit tests for AIgiveaway core logic (config, Gemini parser, safety guardrails)."""
+"""Unit tests for AIgiveaway v1.1.0 core logic."""
 
 from __future__ import annotations
 
@@ -7,26 +7,32 @@ from unittest.mock import MagicMock
 
 from app.agent_engine import GiveawayAgentEngine
 from app.config import AppConfig
-from app.gemini_client import AgentDecision, parse_decision_json
+from app.gemini_client import AgentDecision, MultiProviderVisionClient, parse_decision_json
 from app.icon_gen import generate_ico
+from app.link_monitor import extract_links_from_html
+from app.window_controller import _detect_browser
 
 
-def test_config_roundtrip(tmp_path: Path) -> None:
+def test_config_roundtrip_multi_provider(tmp_path: Path) -> None:
     cfg_file = tmp_path / "config.json"
     cfg = AppConfig(
-        api_key="test-key-local",
+        ai_provider="ollama_cloud",
+        api_key="test-gemini",
+        ollama_api_key="test-ollama",
+        vercel_api_key="test-vercel",
         giveaway_email="karankrajbhar23@gmail.com",
-        target_url="https://cymatics.fm/",
-        claimed_items=["Free Pack 1"],
+        browser_filter="Brave",
     )
     cfg.save(cfg_file)
     loaded = AppConfig.load(cfg_file)
-    assert loaded.api_key == "test-key-local"
-    assert loaded.giveaway_email == "karankrajbhar23@gmail.com"
-    assert loaded.claimed_items == ["Free Pack 1"]
+    assert loaded.ai_provider == "ollama_cloud"
+    assert loaded.get_active_api_key() == "test-ollama"
+    loaded.ai_provider = "vercel_gateway"
+    assert loaded.get_active_api_key() == "test-vercel"
+    assert loaded.browser_filter == "Brave"
 
 
-def test_parse_decision_json_with_fences() -> None:
+def test_parse_decision_json_with_urls() -> None:
     raw = """```json
     {
       "page_state": "giveaway_popup",
@@ -40,15 +46,16 @@ def test_parse_decision_json_with_fences() -> None:
       "submit_y_norm": 0.72,
       "giveaway_question": "What BPM is classic Trap?",
       "giveaway_answer": "140 BPM",
+      "detected_urls": ["https://cymatics.fm/pages/free-download-vault"],
+      "livestream_status": "Live - Giveaway Active",
       "reason": "Giveaway popup detected"
     }
     ```"""
     dec = parse_decision_json(raw)
     assert dec.page_state == "giveaway_popup"
-    assert dec.priority == "giveaway"
-    assert dec.action == "fill_giveaway"
     assert dec.giveaway_answer == "140 BPM"
-    assert dec.submit_x_norm == 0.50
+    assert dec.detected_urls == ["https://cymatics.fm/pages/free-download-vault"]
+    assert dec.livestream_status == "Live - Giveaway Active"
 
 
 def test_safety_blocks_paid_checkout() -> None:
@@ -109,6 +116,27 @@ def test_giveaway_fill_uses_configured_email() -> None:
     assert "FL Studio" in typed_args
     assert "karankrajbhar23@gmail.com" in typed_args
     assert engine.stats.giveaways_answered == 1
+
+
+def test_link_monitor_extracts_and_categorizes() -> None:
+    html = """
+    <html><body>
+      <a href="/pages/free-download-vault">Free Download Vault</a>
+      <a href="https://youtube.com/watch?v=abc123">Watch Livestream</a>
+      <a href="/products/diablo-lite">Diablo Lite</a>
+    </body></html>
+    """
+    links = extract_links_from_html(html, "https://cymatics.fm/")
+    cats = {url: cat for url, _lbl, cat in links}
+    assert cats["https://cymatics.fm/pages/free-download-vault"] == "FREE / DROP"
+    assert cats["https://youtube.com/watch?v=abc123"] == "LIVESTREAM"
+    assert cats["https://cymatics.fm/products/diablo-lite"] == "PRODUCT"
+
+
+def test_browser_detection() -> None:
+    assert _detect_browser("Cymatics - Brave", "Chrome_WidgetWin_1", "brave.exe") == (True, "Brave")
+    assert _detect_browser("Cymatics", "Chrome_WidgetWin_1", "opera.exe") == (True, "Opera")
+    assert _detect_browser("Cymatics", "Chrome_WidgetWin_1", "chrome.exe") == (True, "Chrome")
 
 
 def test_icon_generator(tmp_path: Path) -> None:

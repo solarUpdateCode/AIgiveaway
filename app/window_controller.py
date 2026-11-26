@@ -1,13 +1,22 @@
-"""Strict single-window capture and window-scoped remote control for Windows."""
+"""Strict single-window capture, browser-specific detection, and scoped input for Windows.
+
+Supports selecting windows by specific browser (Chrome, Brave, Opera, Edge,
+Firefox, Vivaldi, Arc, etc.) using exact process executable detection, plus
+click-to-pick browser selection and direct browser launching.
+"""
 
 from __future__ import annotations
 
 import io
 import os
+import shutil
+import subprocess
 import sys
 import time
+import webbrowser
 from dataclasses import dataclass
-from typing import List, Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from PIL import Image
 
@@ -26,16 +35,43 @@ if IS_WINDOWS:
     PW_RENDERFULLCONTENT = 0x00000002
     DWMWA_CLOAKED = 14
     GA_ROOT = 2
+    PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
     user32 = ctypes.windll.user32
     dwmapi = ctypes.windll.dwmapi
+    kernel32 = ctypes.windll.kernel32
 
+
+BROWSER_EXE_MAP: Dict[str, str] = {
+    "chrome.exe": "Chrome",
+    "brave.exe": "Brave",
+    "opera.exe": "Opera",
+    "opera_gx.exe": "Opera",
+    "msedge.exe": "Edge",
+    "firefox.exe": "Firefox",
+    "vivaldi.exe": "Vivaldi",
+    "arc.exe": "Arc",
+    "waterfox.exe": "Firefox",
+    "librewolf.exe": "Firefox",
+}
+
+BROWSER_FILTER_OPTIONS = [
+    "All Browsers",
+    "Chrome",
+    "Brave",
+    "Opera",
+    "Edge",
+    "Firefox",
+    "Vivaldi",
+    "Arc",
+    "All Windows",
+]
 
 BROWSER_KEYWORDS = (
     "chrome",
-    "edge",
-    "firefox",
     "brave",
     "opera",
+    "edge",
+    "firefox",
     "vivaldi",
     "arc",
     "cymatics",
@@ -52,14 +88,35 @@ class WindowInfo:
     height: int
     is_minimized: bool = False
     is_browser: bool = False
+    browser_name: str = ""
+    process_name: str = ""
 
     @property
     def display_label(self) -> str:
-        prefix = "[Browser] " if self.is_browser else ""
+        tag = f"[{self.browser_name}] " if self.browser_name else ("[Browser] " if self.is_browser else "")
         suffix = " (Minimized)" if self.is_minimized else f" [{self.width}x{self.height}]"
-        max_len = 52
+        max_len = 50
         short_title = self.title if len(self.title) <= max_len else self.title[: max_len - 3] + "..."
-        return f"{prefix}{short_title}{suffix}"
+        return f"{tag}{short_title}{suffix}"
+
+
+def _get_process_name(pid: int) -> str:
+    """Safely query process executable filename (e.g. 'brave.exe') on Windows."""
+    if not IS_WINDOWS or not pid:
+        return ""
+    handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, pid)
+    if not handle:
+        return ""
+    try:
+        buf = ctypes.create_unicode_buffer(512)
+        size = wintypes.DWORD(len(buf))
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buf, ctypes.byref(size)):
+            return Path(buf.value).name.lower()
+    except Exception:
+        pass
+    finally:
+        kernel32.CloseHandle(handle)
+    return ""
 
 
 def _is_window_cloaked(hwnd: int) -> bool:
@@ -78,17 +135,34 @@ def _is_window_cloaked(hwnd: int) -> bool:
         return False
 
 
-def _looks_like_browser(title: str, class_name: str) -> bool:
+def _detect_browser(title: str, class_name: str, proc_name: str) -> Tuple[bool, str]:
+    if proc_name in BROWSER_EXE_MAP:
+        return True, BROWSER_EXE_MAP[proc_name]
     tl = title.lower()
-    cl = class_name.lower()
+    if "brave" in tl:
+        return True, "Brave"
+    if "opera" in tl:
+        return True, "Opera"
+    if "edge" in tl:
+        return True, "Edge"
+    if "firefox" in tl:
+        return True, "Firefox"
+    if "vivaldi" in tl:
+        return True, "Vivaldi"
+    if "chrome" in tl:
+        return True, "Chrome"
+    if class_name.lower() in ("chrome_widgetwin_1", "mozillawindowclass", "opera_widgetwin_1"):
+        return True, "Browser"
     if any(k in tl for k in BROWSER_KEYWORDS):
-        return True
-    if cl in ("chrome_widgetwin_1", "mozillawindowclass", "opera_widgetwin_1"):
-        return True
-    return False
+        return True, "Browser"
+    return False, ""
 
 
-def list_selectable_windows(exclude_hwnd: Optional[int] = None) -> List[WindowInfo]:
+def list_selectable_windows(
+    exclude_hwnd: Optional[int] = None,
+    browser_filter: str = "All Browsers",
+) -> List[WindowInfo]:
+    """Return desktop windows filtered by browser (Chrome, Brave, Opera, Edge, etc.)."""
     if not IS_WINDOWS:
         return []
 
@@ -100,10 +174,12 @@ def list_selectable_windows(exclude_hwnd: Optional[int] = None) -> List[WindowIn
             return True
         if not win32gui.IsWindowVisible(hwnd):
             return True
+        proc_name = ""
         try:
             _, pid = win32process.GetWindowThreadProcessId(hwnd)
             if pid == my_pid:
                 return True
+            proc_name = _get_process_name(pid)
         except Exception:
             pass
 
@@ -115,14 +191,12 @@ def list_selectable_windows(exclude_hwnd: Optional[int] = None) -> List[WindowIn
             return True
 
         title = win32gui.GetWindowText(hwnd).strip()
-        if not title:
-            return True
-        if title in ("Program Manager", "Windows Input Experience", "Default IME"):
+        if not title or title in ("Program Manager", "Windows Input Experience", "Default IME"):
             return True
 
         cls_name = win32gui.GetClassName(hwnd)
         minimized = bool(win32gui.IsIconic(hwnd))
-        is_browser = _looks_like_browser(title, cls_name)
+        is_browser, browser_name = _detect_browser(title, cls_name, proc_name)
 
         try:
             left, top, right, bottom = win32gui.GetWindowRect(hwnd)
@@ -133,6 +207,13 @@ def list_selectable_windows(exclude_hwnd: Optional[int] = None) -> List[WindowIn
         if not minimized and (w < 180 or h < 120):
             return True
 
+        # Apply browser filter
+        if browser_filter == "All Browsers" and not is_browser:
+            return True
+        if browser_filter not in ("All Browsers", "All Windows"):
+            if browser_name.lower() != browser_filter.lower():
+                return True
+
         windows.append(
             WindowInfo(
                 hwnd=hwnd,
@@ -142,6 +223,8 @@ def list_selectable_windows(exclude_hwnd: Optional[int] = None) -> List[WindowIn
                 height=h,
                 is_minimized=minimized,
                 is_browser=is_browser,
+                browser_name=browser_name,
+                process_name=proc_name,
             )
         )
         return True
@@ -160,7 +243,62 @@ def list_selectable_windows(exclude_hwnd: Optional[int] = None) -> List[WindowIn
     return windows
 
 
-def pick_window_on_next_click(timeout_sec: float = 12.0) -> Optional[WindowInfo]:
+def launch_browser_with_url(browser_name: str, url: str) -> bool:
+    """Open URL in the chosen browser (Chrome, Brave, Opera, Edge, Firefox, Vivaldi) or default."""
+    if not IS_WINDOWS:
+        webbrowser.open(url)
+        return True
+
+    local_app = os.environ.get("LOCALAPPDATA", "")
+    prog_files = os.environ.get("PROGRAMFILES", r"C:\Program Files")
+    prog_x86 = os.environ.get("PROGRAMFILES(X86)", r"C:\Program Files (x86)")
+
+    candidate_paths: Dict[str, List[str]] = {
+        "Chrome": [
+            rf"{prog_files}\Google\Chrome\Application\chrome.exe",
+            rf"{prog_x86}\Google\Chrome\Application\chrome.exe",
+            rf"{local_app}\Google\Chrome\Application\chrome.exe",
+        ],
+        "Brave": [
+            rf"{prog_files}\BraveSoftware\Brave-Browser\Application\brave.exe",
+            rf"{prog_x86}\BraveSoftware\Brave-Browser\Application\brave.exe",
+            rf"{local_app}\BraveSoftware\Brave-Browser\Application\brave.exe",
+        ],
+        "Opera": [
+            rf"{local_app}\Programs\Opera\opera.exe",
+            rf"{local_app}\Programs\Opera GX\opera.exe",
+            rf"{prog_files}\Opera\opera.exe",
+        ],
+        "Edge": [
+            rf"{prog_x86}\Microsoft\Edge\Application\msedge.exe",
+            rf"{prog_files}\Microsoft\Edge\Application\msedge.exe",
+        ],
+        "Firefox": [
+            rf"{prog_files}\Mozilla Firefox\firefox.exe",
+            rf"{prog_x86}\Mozilla Firefox\firefox.exe",
+        ],
+        "Vivaldi": [
+            rf"{local_app}\Vivaldi\Application\vivaldi.exe",
+            rf"{prog_files}\Vivaldi\Application\vivaldi.exe",
+        ],
+    }
+
+    for exe in candidate_paths.get(browser_name, []):
+        if os.path.exists(exe):
+            subprocess.Popen([exe, url])
+            return True
+
+    exe_on_path = shutil.which(browser_name.lower())
+    if exe_on_path:
+        subprocess.Popen([exe_on_path, url])
+        return True
+
+    webbrowser.open(url)
+    return True
+
+
+def pick_window_on_next_click(timeout_sec: float = 15.0) -> Optional[WindowInfo]:
+    """Wait for the user to click any browser window and lock onto its root HWND."""
     if not IS_WINDOWS:
         return None
 
@@ -178,16 +316,19 @@ def pick_window_on_next_click(timeout_sec: float = 12.0) -> Optional[WindowInfo]
             hwnd = win32gui.WindowFromPoint(pt)
             if hwnd:
                 root_hwnd = user32.GetAncestor(hwnd, GA_ROOT) or hwnd
+                proc_name = ""
                 try:
                     _, pid = win32process.GetWindowThreadProcessId(root_hwnd)
                     if pid == my_pid:
                         time.sleep(0.15)
                         continue
+                    proc_name = _get_process_name(pid)
                 except Exception:
                     pass
                 title = win32gui.GetWindowText(root_hwnd).strip()
                 cls_name = win32gui.GetClassName(root_hwnd)
                 left, top, right, bottom = win32gui.GetWindowRect(root_hwnd)
+                is_browser, b_name = _detect_browser(title, cls_name, proc_name)
                 return WindowInfo(
                     hwnd=root_hwnd,
                     title=title or f"Window {root_hwnd}",
@@ -195,21 +336,23 @@ def pick_window_on_next_click(timeout_sec: float = 12.0) -> Optional[WindowInfo]
                     width=max(0, right - left),
                     height=max(0, bottom - top),
                     is_minimized=bool(win32gui.IsIconic(root_hwnd)),
-                    is_browser=_looks_like_browser(title, cls_name),
+                    is_browser=is_browser,
+                    browser_name=b_name,
+                    process_name=proc_name,
                 )
         time.sleep(0.04)
     return None
 
 
 class ScopedWindowController:
+    """Controls ONLY the single user-approved HWND."""
+
     def __init__(self, hwnd: int, mode: str = "background") -> None:
         self.hwnd = hwnd
         self.mode = mode
 
     def is_valid(self) -> bool:
-        if not IS_WINDOWS:
-            return False
-        return bool(self.hwnd and win32gui.IsWindow(self.hwnd))
+        return bool(IS_WINDOWS and self.hwnd and win32gui.IsWindow(self.hwnd))
 
     def is_minimized(self) -> bool:
         if not IS_WINDOWS or not self.is_valid():
@@ -240,15 +383,12 @@ class ScopedWindowController:
     def capture_image(self, max_width: int = 1280) -> Optional[Image.Image]:
         if not IS_WINDOWS or not self.is_valid() or self.is_minimized():
             return None
-
         width, height = self.get_client_size()
         if width < 50 or height < 50:
             return None
 
         hwnd_dc = win32gui.GetWindowDC(self.hwnd)
-        mfc_dc = None
-        save_dc = None
-        bitmap = None
+        mfc_dc = save_dc = bitmap = None
         try:
             mfc_dc = win32ui.CreateDCFromHandle(hwnd_dc)
             save_dc = mfc_dc.CreateCompatibleDC()
@@ -314,9 +454,7 @@ class ScopedWindowController:
     def click_normalized(self, x_norm: float, y_norm: float) -> bool:
         if not IS_WINDOWS or not self.is_valid() or self.is_minimized():
             return False
-
         cx, cy = self._norm_to_client_xy(x_norm, y_norm)
-
         if self.mode == "background":
             target, lx, ly = self._find_child_at(cx, cy)
             lparam = win32api.MAKELONG(lx, ly)
@@ -326,7 +464,6 @@ class ScopedWindowController:
             time.sleep(0.05)
             win32gui.PostMessage(target, win32con.WM_LBUTTONUP, 0, lparam)
             return True
-
         try:
             win32gui.SetForegroundWindow(self.hwnd)
             time.sleep(0.08)
@@ -347,21 +484,18 @@ class ScopedWindowController:
     def type_text(self, text: str, press_enter: bool = False) -> bool:
         if not IS_WINDOWS or not self.is_valid() or not text:
             return False
-
-        target = self.hwnd
         for ch in text:
-            win32gui.PostMessage(target, win32con.WM_CHAR, ord(ch), 0)
+            win32gui.PostMessage(self.hwnd, win32con.WM_CHAR, ord(ch), 0)
             time.sleep(0.01)
         if press_enter:
-            win32gui.PostMessage(target, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
+            win32gui.PostMessage(self.hwnd, win32con.WM_KEYDOWN, win32con.VK_RETURN, 0)
             time.sleep(0.02)
-            win32gui.PostMessage(target, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
+            win32gui.PostMessage(self.hwnd, win32con.WM_KEYUP, win32con.VK_RETURN, 0)
         return True
 
     def scroll(self, direction: str = "down", ticks: int = 4) -> bool:
         if not IS_WINDOWS or not self.is_valid() or self.is_minimized():
             return False
-
         cx, cy = self._norm_to_client_xy(0.5, 0.5)
         sx, sy = win32gui.ClientToScreen(self.hwnd, (cx, cy))
         delta = -120 * ticks if direction == "down" else 120 * ticks
