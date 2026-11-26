@@ -1,7 +1,9 @@
 """Gemini Vision REST client with full support for AQ.* Auth Keys and AIza keys.
 
 Handles both Google AI Studio (generativelanguage.googleapis.com) and Vertex AI
-Express Mode (aiplatform.googleapis.com) endpoints with automatic fallback.
+Express Mode (aiplatform.googleapis.com) endpoints with automatic fallback,
+proper thinking-token configuration for Gemini 2.5/3.x, and automatic model
+fallback if a chosen model returns 404 NOT_FOUND.
 """
 
 from __future__ import annotations
@@ -21,20 +23,20 @@ VERTEX_EXPRESS_BASE = "https://aiplatform.googleapis.com/v1/publishers/google/mo
 AVAILABLE_MODELS = [
     "gemini-2.5-flash",
     "gemini-2.5-flash-lite",
-    "gemini-2.5-pro",
+    "gemini-3.6-flash",
+    "gemini-3.5-flash-lite",
     "gemini-2.0-flash",
+    "gemini-2.5-pro",
 ]
 
 
 @dataclass
 class AgentDecision:
-    """Structured action returned by Gemini Vision for the tracked window."""
-
-    page_state: str  # "livestream", "learn_more", "cart", "checkout", "order_complete", "giveaway_popup", "other"
-    priority: str  # "giveaway" or "normal"
-    action: str  # "click", "type_and_submit", "fill_giveaway", "scroll_down", "scroll_up", "go_back", "wait"
-    x_norm: Optional[float] = None  # 0.0 to 1.0 relative to window client width
-    y_norm: Optional[float] = None  # 0.0 to 1.0 relative to window client height
+    page_state: str
+    priority: str
+    action: str
+    x_norm: Optional[float] = None
+    y_norm: Optional[float] = None
     text_to_type: Optional[str] = None
     email_x_norm: Optional[float] = None
     email_y_norm: Optional[float] = None
@@ -78,7 +80,7 @@ PRIORITY 2 (NORMAL): FREE STUFF TRACKER & $0.00 CHECKOUT LOOP
      - If the total is ANY amount greater than $0.00 (e.g. $1.00, $15.00), set cart_total_is_zero=false and action="wait" with reason explaining a paid item was detected. NEVER click Complete Order / Pay if total > $0.00!
    - If total is $0.00 / FREE: fill email if requested, or click "Complete Order" / "Complete Free Order" / "Continue".
 4. After Order Complete / Thank You page:
-   - Set page_state="order_complete" and action="go_back" (or navigate back to tracked URL) so we return to the livestream page to watch for newly unlocked freebies.
+   - Set page_state="order_complete" and action="go_back" so we return to the livestream page to watch for newly unlocked freebies.
 5. If nothing new is currently unlocked and no giveaway question is visible:
    - Either scroll_down gently to check lower items, or action="wait" if already at the bottom / waiting for the next livestream unlock.
 
@@ -106,9 +108,10 @@ Return STRICT JSON ONLY (no markdown fences, no commentary) matching this schema
 
 
 def parse_decision_json(raw_text: str) -> AgentDecision:
-    """Safely parse Gemini's JSON response into an AgentDecision."""
-    cleaned = raw_text.strip()
-    # Strip markdown code fences if the model wrapped JSON anyway
+    cleaned = (raw_text or "").strip()
+    if not cleaned:
+        return AgentDecision(page_state="other", priority="normal", action="wait", reason="Empty AI response")
+
     fence_match = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", cleaned, re.DOTALL)
     if fence_match:
         cleaned = fence_match.group(1)
@@ -147,15 +150,27 @@ def parse_decision_json(raw_text: str) -> AgentDecision:
     )
 
 
-class GeminiVisionClient:
-    """HTTP client for Gemini multimodal inference supporting AQ.* and AIza keys."""
+def _generation_config_for_model(model: str, json_mode: bool = True) -> Dict[str, Any]:
+    cfg: Dict[str, Any] = {
+        "temperature": 0.1,
+        "maxOutputTokens": 2048,
+    }
+    if json_mode:
+        cfg["responseMimeType"] = "application/json"
 
+    ml = model.lower()
+    if ml.startswith("gemini-2.5-flash"):
+        cfg["thinkingConfig"] = {"thinkingBudget": 0}
+    return cfg
+
+
+class GeminiVisionClient:
     def __init__(
         self,
         api_key: str,
         model: str = "gemini-2.5-flash",
         endpoint_mode: str = "auto",
-        timeout_sec: float = 20.0,
+        timeout_sec: float = 25.0,
     ) -> None:
         self.api_key = (api_key or "").strip()
         self.model = (model or "gemini-2.5-flash").strip()
@@ -163,61 +178,76 @@ class GeminiVisionClient:
         self.timeout_sec = timeout_sec
         self._resolved_endpoint: Optional[str] = None
 
-    def _build_request(self, mode: str) -> Tuple[str, Dict[str, str], Dict[str, str]]:
+    def _build_request(self, mode: str, model: str) -> Tuple[str, Dict[str, str], Dict[str, str]]:
         headers = {"Content-Type": "application/json"}
         params: Dict[str, str] = {}
         if mode == "vertex_express":
-            url = f"{VERTEX_EXPRESS_BASE}/{self.model}:generateContent"
+            url = f"{VERTEX_EXPRESS_BASE}/{model}:generateContent"
+            params["key"] = self.api_key
+        elif mode == "gemini_studio_query":
+            url = f"{GEMINI_STUDIO_BASE}/{model}:generateContent"
             params["key"] = self.api_key
         else:
-            url = f"{GEMINI_STUDIO_BASE}/{self.model}:generateContent"
+            url = f"{GEMINI_STUDIO_BASE}/{model}:generateContent"
             headers["x-goog-api-key"] = self.api_key
         return url, headers, params
 
-    def _call_generate_content(self, payload: Dict[str, Any]) -> Dict[str, Any]:
+    def _call_generate_content(self, payload_builder) -> Dict[str, Any]:
         if not self.api_key:
             raise ValueError("Gemini API key is empty. Paste your key in Settings.")
 
-        modes_to_try: List[str]
         if self.endpoint_mode in ("gemini_studio", "vertex_express"):
             modes_to_try = [self.endpoint_mode]
         elif self._resolved_endpoint:
             modes_to_try = [self._resolved_endpoint]
         else:
-            # Current Google AI Studio AQ.* keys work on generativelanguage.googleapis.com;
-            # Vertex AI Express AQ.* keys work on aiplatform.googleapis.com.
-            modes_to_try = ["gemini_studio", "vertex_express"]
+            modes_to_try = ["gemini_studio", "vertex_express", "gemini_studio_query"]
 
-        last_error: Optional[Exception] = None
-        for mode in modes_to_try:
-            url, headers, params = self._build_request(mode)
-            try:
-                resp = requests.post(
-                    url,
-                    headers=headers,
-                    params=params,
-                    json=payload,
-                    timeout=self.timeout_sec,
-                )
-                if resp.status_code == 200:
-                    self._resolved_endpoint = mode
-                    return resp.json()
-                # If 403/401 on first mode in auto mode, try fallback endpoint
-                if resp.status_code in (401, 403, 404) and len(modes_to_try) > 1:
-                    last_error = RuntimeError(
-                        f"HTTP {resp.status_code} from {mode}: {resp.text[:300]}"
+        models_to_try = [self.model] + [m for m in AVAILABLE_MODELS if m != self.model and "flash" in m]
+
+        last_error: Optional[str] = None
+        for model_name in models_to_try:
+            payload = payload_builder(model_name)
+            got_404_on_all = True
+            for mode in modes_to_try:
+                url, headers, params = self._build_request(mode, model_name)
+                try:
+                    resp = requests.post(
+                        url,
+                        headers=headers,
+                        params=params,
+                        json=payload,
+                        timeout=self.timeout_sec,
                     )
+                    if resp.status_code == 200:
+                        self._resolved_endpoint = mode
+                        self.model = model_name
+                        return resp.json()
+                    if resp.status_code != 404:
+                        got_404_on_all = False
+                    last_error = f"HTTP {resp.status_code} ({mode}/{model_name}): {resp.text[:260]}"
+                    if resp.status_code in (401, 403, 404):
+                        continue
+                    if resp.status_code == 400 and "thinkingConfig" in str(payload):
+                        retry_payload = dict(payload)
+                        gc = dict(retry_payload.get("generationConfig", {}))
+                        gc.pop("thinkingConfig", None)
+                        retry_payload["generationConfig"] = gc
+                        resp2 = requests.post(url, headers=headers, params=params, json=retry_payload, timeout=self.timeout_sec)
+                        if resp2.status_code == 200:
+                            self._resolved_endpoint = mode
+                            self.model = model_name
+                            return resp2.json()
+                        last_error = f"HTTP {resp2.status_code} ({mode}/{model_name}): {resp2.text[:260]}"
+                except requests.RequestException as exc:
+                    got_404_on_all = False
+                    last_error = f"Network error ({mode}): {exc}"
                     continue
-                raise RuntimeError(
-                    f"Gemini API error ({resp.status_code}): {resp.text[:400]}"
-                )
-            except requests.RequestException as exc:
-                last_error = exc
-                if len(modes_to_try) > 1:
-                    continue
-                raise
 
-        raise RuntimeError(f"All Gemini endpoints failed: {last_error}")
+            if not got_404_on_all:
+                break
+
+        raise RuntimeError(last_error or "Gemini API request failed.")
 
     @staticmethod
     def _extract_text(response_json: Dict[str, Any]) -> str:
@@ -225,19 +255,22 @@ class GeminiVisionClient:
         if not candidates:
             raise RuntimeError(f"Empty Gemini response: {response_json}")
         parts = candidates[0].get("content", {}).get("parts", [])
-        texts = [p.get("text", "") for p in parts if isinstance(p, dict) and p.get("text")]
+        texts = [
+            p.get("text", "")
+            for p in parts
+            if isinstance(p, dict) and p.get("text") and not p.get("thought")
+        ]
         return "\n".join(texts).strip()
 
     def test_connection(self) -> Tuple[bool, str]:
-        """Verify the API key and model work before starting background tracking."""
-        payload = {
-            "contents": [
-                {"role": "user", "parts": [{"text": "Reply with exactly: OK"}]}
-            ],
-            "generationConfig": {"temperature": 0.0, "maxOutputTokens": 16},
-        }
+        def _build(model_name: str) -> Dict[str, Any]:
+            return {
+                "contents": [{"role": "user", "parts": [{"text": "Reply with exactly: OK"}]}],
+                "generationConfig": _generation_config_for_model(model_name, json_mode=False),
+            }
+
         try:
-            res = self._call_generate_content(payload)
+            res = self._call_generate_content(_build)
             reply = self._extract_text(res)
             endpoint_label = self._resolved_endpoint or self.endpoint_mode
             return True, f"Connected ({endpoint_label}, {self.model}): {reply}"
@@ -258,7 +291,6 @@ class GeminiVisionClient:
         auto_return_to_page: bool,
         recent_actions: List[str],
     ) -> AgentDecision:
-        """Send a single window screenshot to Gemini and get a structured action."""
         b64_img = base64.b64encode(image_jpeg_bytes).decode("ascii")
         user_context = (
             f"Target URL: {target_url}\n"
@@ -273,28 +305,21 @@ class GeminiVisionClient:
             "Inspect this screenshot of the ONLY allowed browser window and return your JSON decision."
         )
 
-        payload = {
-            "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
-            "contents": [
-                {
-                    "role": "user",
-                    "parts": [
-                        {"text": user_context},
-                        {
-                            "inlineData": {
-                                "mimeType": "image/jpeg",
-                                "data": b64_img,
-                            }
-                        },
-                    ],
-                }
-            ],
-            "generationConfig": {
-                "temperature": 0.1,
-                "maxOutputTokens": 512,
-                "responseMimeType": "application/json",
-            },
-        }
-        res = self._call_generate_content(payload)
+        def _build(model_name: str) -> Dict[str, Any]:
+            return {
+                "systemInstruction": {"parts": [{"text": SYSTEM_PROMPT}]},
+                "contents": [
+                    {
+                        "role": "user",
+                        "parts": [
+                            {"text": user_context},
+                            {"inlineData": {"mimeType": "image/jpeg", "data": b64_img}},
+                        ],
+                    }
+                ],
+                "generationConfig": _generation_config_for_model(model_name, json_mode=True),
+            }
+
+        res = self._call_generate_content(_build)
         raw_text = self._extract_text(res)
         return parse_decision_json(raw_text)
