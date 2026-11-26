@@ -17,7 +17,12 @@ from app.agent_engine import AgentStats, GiveawayAgentEngine
 from app.config import AppConfig
 from app.gemini_client import AVAILABLE_MODELS, GeminiVisionClient
 from app.icon_gen import create_app_icon_image
-from app.window_controller import ScopedWindowController, WindowInfo, list_selectable_windows
+from app.window_controller import (
+    ScopedWindowController,
+    WindowInfo,
+    list_selectable_windows,
+    pick_window_on_next_click,
+)
 
 try:
     import pystray
@@ -30,13 +35,11 @@ ctk.set_default_color_theme("blue")
 
 
 class AIgiveawayApp(ctk.CTk):
-    """Main desktop window with one-click ON/OFF, window selector, and live log."""
-
     def __init__(self) -> None:
         super().__init__()
         self.title(f"{__app_name__} v{__version__} — Cymatics Live Freebie & Giveaway AI")
-        self.geometry("980x700")
-        self.minsize(880, 620)
+        self.geometry("1040x720")
+        self.minsize(920, 640)
 
         self.config_data = AppConfig.load()
         self._windows_map: Dict[str, WindowInfo] = {}
@@ -70,7 +73,6 @@ class AIgiveawayApp(ctk.CTk):
         self.grid_columnconfigure(0, weight=1)
         self.grid_rowconfigure(2, weight=1)
 
-        # ==================== 1. TOP HEADER & BIG ON/OFF BAR ====================
         header = ctk.CTkFrame(self, corner_radius=12, fg_color="#0f172a")
         header.grid(row=0, column=0, padx=16, pady=(14, 8), sticky="ew")
         header.grid_columnconfigure(1, weight=1)
@@ -79,7 +81,7 @@ class AIgiveawayApp(ctk.CTk):
         title_col.grid(row=0, column=0, padx=16, pady=12, sticky="w")
         ctk.CTkLabel(
             title_col,
-            text="AIgiveaway",
+            text=f"AIgiveaway v{__version__}",
             font=ctk.CTkFont(size=24, weight="bold"),
             text_color="#38bdf8",
         ).pack(anchor="w")
@@ -115,13 +117,11 @@ class AIgiveawayApp(ctk.CTk):
         )
         self.power_btn.grid(row=0, column=2, padx=(6, 16), pady=12)
 
-        # ==================== 2. QUICK SETUP CARD ====================
         setup = ctk.CTkFrame(self, corner_radius=12)
         setup.grid(row=1, column=0, padx=16, pady=6, sticky="ew")
         setup.grid_columnconfigure(1, weight=1)
         setup.grid_columnconfigure(3, weight=1)
 
-        # Row 0: Allowed Window Picker (STRICT WINDOW-ONLY SCOPE)
         ctk.CTkLabel(
             setup,
             text="Allowed Window ONLY:",
@@ -132,32 +132,41 @@ class AIgiveawayApp(ctk.CTk):
         self.window_menu = ctk.CTkOptionMenu(
             setup,
             variable=self.window_var,
-            values=["Click Refresh to list windows..."],
-            width=420,
+            values=["Click Refresh or Pick Browser..."],
+            dynamic_resizing=False,
         )
         self.window_menu.grid(row=0, column=1, columnspan=2, padx=4, pady=(12, 6), sticky="ew")
 
         win_btns = ctk.CTkFrame(setup, fg_color="transparent")
         win_btns.grid(row=0, column=3, padx=(6, 14), pady=(12, 6), sticky="e")
-        ctk.CTkButton(win_btns, text="Refresh", width=80, command=self._refresh_windows).pack(side="left", padx=3)
+
+        self.pick_btn = ctk.CTkButton(
+            win_btns,
+            text="Pick Browser",
+            width=102,
+            fg_color="#7c3aed",
+            hover_color="#6d28d9",
+            command=self._pick_window_clicked,
+        )
+        self.pick_btn.pack(side="left", padx=2)
+        ctk.CTkButton(win_btns, text="Refresh", width=70, command=self._refresh_windows).pack(side="left", padx=2)
         ctk.CTkButton(
             win_btns,
             text="Highlight",
-            width=85,
+            width=74,
             fg_color="#334155",
             hover_color="#475569",
             command=self._highlight_selected_window,
-        ).pack(side="left", padx=3)
+        ).pack(side="left", padx=2)
         ctk.CTkButton(
             win_btns,
             text="Open Cymatics",
-            width=115,
+            width=108,
             fg_color="#0284c7",
             hover_color="#0369a1",
             command=lambda: webbrowser.open(self.url_entry.get().strip() or "https://cymatics.fm/"),
-        ).pack(side="left", padx=3)
+        ).pack(side="left", padx=2)
 
-        # Row 1: Target URL & Giveaway Email
         ctk.CTkLabel(setup, text="Tracked Page URL:", font=ctk.CTkFont(size=13)).grid(
             row=1, column=0, padx=(14, 8), pady=6, sticky="w"
         )
@@ -172,7 +181,6 @@ class AIgiveawayApp(ctk.CTk):
         self.email_entry.insert(0, self.config_data.giveaway_email)
         self.email_entry.grid(row=1, column=3, padx=(4, 14), pady=6, sticky="ew")
 
-        # Row 2: Gemini API Key & Model
         ctk.CTkLabel(setup, text="Gemini API Key:", font=ctk.CTkFont(size=13)).grid(
             row=2, column=0, padx=(14, 8), pady=6, sticky="w"
         )
@@ -199,7 +207,7 @@ class AIgiveawayApp(ctk.CTk):
         model_frame = ctk.CTkFrame(setup, fg_color="transparent")
         model_frame.grid(row=2, column=3, padx=(4, 14), pady=6, sticky="ew")
         self.model_var = ctk.StringVar(value=self.config_data.model)
-        ctk.CTkOptionMenu(model_frame, variable=self.model_var, values=AVAILABLE_MODELS, width=160).pack(
+        ctk.CTkOptionMenu(model_frame, variable=self.model_var, values=AVAILABLE_MODELS, width=165).pack(
             side="left", padx=(0, 6)
         )
         self.interval_entry = ctk.CTkEntry(model_frame, width=58)
@@ -207,7 +215,6 @@ class AIgiveawayApp(ctk.CTk):
         self.interval_entry.pack(side="left")
         ctk.CTkLabel(model_frame, text="sec", text_color="#94a3b8").pack(side="left", padx=4)
 
-        # Row 3: Feature Toggles
         toggles = ctk.CTkFrame(setup, fg_color="transparent")
         toggles.grid(row=3, column=0, columnspan=4, padx=14, pady=(6, 12), sticky="ew")
 
@@ -230,14 +237,12 @@ class AIgiveawayApp(ctk.CTk):
         )
         ctk.CTkCheckBox(toggles, text="Hide to System Tray on Close", variable=self.var_tray).grid(row=1, column=3, padx=8, pady=3, sticky="w")
 
-        # ==================== 3. LIVE PREVIEW + ACTIVITY LOG ====================
         bottom = ctk.CTkFrame(self, fg_color="transparent")
         bottom.grid(row=2, column=0, padx=16, pady=(6, 14), sticky="nsew")
         bottom.grid_columnconfigure(0, weight=2)
         bottom.grid_columnconfigure(1, weight=3)
         bottom.grid_rowconfigure(0, weight=1)
 
-        # Left: Allowed Window Live Preview + Stats
         preview_card = ctk.CTkFrame(bottom, corner_radius=12)
         preview_card.grid(row=0, column=0, padx=(0, 8), sticky="nsew")
         preview_card.grid_rowconfigure(1, weight=1)
@@ -252,7 +257,7 @@ class AIgiveawayApp(ctk.CTk):
 
         self.preview_label = ctk.CTkLabel(
             preview_card,
-            text="Select your Cymatics browser window\nand click TURN AI ON.\n\nOnly that single window is visible to the AI.",
+            text="Click 'Pick Browser' (or use the dropdown)\nto lock onto your Cymatics browser window,\nthen click TURN AI ON.",
             text_color="#64748b",
             fg_color="#0b1120",
             corner_radius=8,
@@ -267,7 +272,6 @@ class AIgiveawayApp(ctk.CTk):
         )
         self.stats_label.grid(row=2, column=0, padx=12, pady=(4, 10))
 
-        # Right: Live Activity Log
         log_card = ctk.CTkFrame(bottom, corner_radius=12)
         log_card.grid(row=0, column=1, padx=(8, 0), sticky="nsew")
         log_card.grid_rowconfigure(1, weight=1)
@@ -296,9 +300,8 @@ class AIgiveawayApp(ctk.CTk):
         self.log_box = ctk.CTkTextbox(log_card, font=ctk.CTkFont(family="Consolas", size=12), state="disabled")
         self.log_box.grid(row=1, column=0, padx=12, pady=(4, 12), sticky="nsew")
 
-        self._append_log("Ready. Select your Cymatics browser window, enter your Gemini API key, and click TURN AI ON.")
+        self._append_log("Ready. Click 'Pick Browser' (or choose from dropdown), test your API key, and click TURN AI ON.")
 
-    # ==================== UI ACTIONS ====================
     def _collect_config(self) -> AppConfig:
         try:
             interval = max(0.8, float(self.interval_entry.get().strip()))
@@ -343,36 +346,59 @@ class AIgiveawayApp(ctk.CTk):
         if not cfg.api_key:
             self._append_log("[ERROR] Paste your Gemini API key first.")
             return
-        self._append_log(f"Testing Gemini API key with model {cfg.model}...")
+        self._append_log(f"Testing Gemini API key with {cfg.model} (auto-fallback enabled)...")
 
         def _worker() -> None:
             client = GeminiVisionClient(cfg.api_key, model=cfg.model, endpoint_mode=cfg.api_endpoint_mode)
             ok, msg = client.test_connection()
+            if ok and client.model != cfg.model:
+                self.after(0, self.model_var.set, client.model)
             prefix = "[OK]" if ok else "[FAILED]"
             self.after(0, self._append_log, f"{prefix} {msg}")
 
         threading.Thread(target=_worker, daemon=True).start()
 
     def _refresh_windows(self) -> None:
-        my_hwnd = self.winfo_id() if sys.platform == "win32" else None
-        wins: List[WindowInfo] = list_selectable_windows(exclude_hwnd=my_hwnd)
+        wins: List[WindowInfo] = list_selectable_windows()
         self._windows_map = {w.display_label: w for w in wins}
 
         labels = list(self._windows_map.keys())
         if not labels:
-            labels = ["No open windows found — click Refresh"]
+            labels = ["No windows found — open Chrome/Edge & click Refresh"]
             self.window_menu.configure(values=labels)
             self.window_var.set(labels[0])
             return
 
         self.window_menu.configure(values=labels)
-        # Prefer last selected or Cymatics window automatically
         chosen = labels[0]
         for lbl, win in self._windows_map.items():
             if self.config_data.last_window_title and self.config_data.last_window_title == win.title:
                 chosen = lbl
                 break
         self.window_var.set(chosen)
+        self._append_log(f"Found {len(wins)} windows ({sum(1 for w in wins if w.is_browser)} browser windows).")
+
+    def _pick_window_clicked(self) -> None:
+        self.pick_btn.configure(text="Click Browser...", state="disabled")
+        self._append_log("Click directly on your Cymatics browser window now (or press ESC to cancel)...")
+
+        def _worker() -> None:
+            picked = pick_window_on_next_click(timeout_sec=15.0)
+            self.after(0, self._finish_pick_window, picked)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _finish_pick_window(self, picked: Optional[WindowInfo]) -> None:
+        self.pick_btn.configure(text="Pick Browser", state="normal")
+        if picked is None:
+            self._append_log("Window pick cancelled or timed out.")
+            return
+        label = picked.display_label
+        self._windows_map[label] = picked
+        self.window_menu.configure(values=list(self._windows_map.keys()))
+        self.window_var.set(label)
+        self.config_data.last_window_title = picked.title
+        self._append_log(f"Locked onto browser window: '{picked.title}'")
 
     def _highlight_selected_window(self) -> None:
         win = self._windows_map.get(self.window_var.get())
@@ -398,9 +424,11 @@ class AIgiveawayApp(ctk.CTk):
 
         win = self._windows_map.get(self.window_var.get())
         if not win:
-            self._append_log("[ERROR] Please select the allowed Cymatics browser window first.")
+            self._append_log("[ERROR] Please select or pick your Cymatics browser window first.")
             return
 
+        ctrl = ScopedWindowController(win.hwnd)
+        ctrl.restore_if_minimized()
         self.engine.start(hwnd=win.hwnd, config=cfg)
         self.power_btn.configure(text="TURN AI OFF", fg_color="#dc2626", hover_color="#b91c1c")
 
@@ -439,7 +467,6 @@ class AIgiveawayApp(ctk.CTk):
         self.log_box.see("end")
         self.log_box.configure(state="disabled")
 
-    # ==================== SYSTEM TRAY SUPPORT ====================
     def _on_close(self) -> None:
         cfg = self._collect_config()
         cfg.save()
